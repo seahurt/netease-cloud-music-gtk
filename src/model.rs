@@ -1,129 +1,283 @@
 //
 // model.rs
-// Copyright (C) 2020 gmg137 <gmg137@live.com>
-// Distributed under terms of the MIT license.
+// Copyright (C) 2022 gmg137 <gmg137 AT live.com>
+// Distributed under terms of the GPL-3.0-or-later license.
 //
-use crate::utils::Configs;
-use async_std::io;
-use chrono::prelude::*;
-use custom_error::custom_error;
-use lazy_static::lazy_static;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+use crate::application::Action;
+use glib::{SendWeakRef, Sender};
+use gtk::{gdk_pixbuf, glib, prelude::*, Image, Picture};
+use ncm_api::{SingerInfo, SongInfo, SongList};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 
-pub(crate) type NCMResult<T> = Result<T, Errors>;
-
-lazy_static! {
-    pub(crate) static ref NCM_XDG: xdg::BaseDirectories = {
-        xdg::BaseDirectories::with_prefix("netease-cloud-music-gtk").unwrap()
-    };
-
-    // 数据目录
-    pub(crate) static ref NCM_DATA: PathBuf = {
-        NCM_XDG.create_data_directory(NCM_XDG.get_data_home()).unwrap()
-    };
-
-    // 配置目录
-    pub(crate) static ref NCM_CONFIG: PathBuf = {
-        NCM_XDG.create_config_directory(NCM_XDG.get_config_home()).unwrap()
-    };
-
-    // 缓存目录
-    pub(crate) static ref NCM_CACHE: PathBuf = {
-        NCM_XDG.create_cache_directory(NCM_XDG.get_cache_home()).unwrap()
-    };
-
-    // 歌词文件目录
-    pub(crate) static ref LYRICS_PATH: &'static str = {
-        if let Some(path) = dirs::home_dir() {
-            let lyrics_path = format!("{}/.lyrics", path.display());
-            if !std::path::Path::new(&lyrics_path).exists() {
-                std::fs::create_dir_all(&lyrics_path).unwrap_or(());
-            }
-            return Box::leak(Box::new(lyrics_path));
-        }
-        ".lyrics"
-    };
-
-    // 当前时期-天
-    pub(crate) static ref DATE_DAY: u32 = {
-        let date = Local::now();
-        date.day()
-    };
-
-    // 当前时期-周
-    pub(crate) static ref ISO_WEEK: u32 = {
-        let date = Local::now();
-        date.iso_week().week()
-    };
-
-    // 当前时期-月
-    pub(crate) static ref DATE_MONTH: u32 = {
-        let date = Local::now();
-        date.month()
-    };
-
-    // 排行榜 id
-    pub(crate) static ref TOP_ID: HashMap<u8,u64>= {
-        let mut m = HashMap::new();
-        m.insert(0, 19_723_756);
-        m.insert(1, 3_779_629);
-        m.insert(2, 2_884_035);
-        m.insert(3, 3_778_678);
-        m.insert(4, 71_384_707);
-        m.insert(5, 71_385_702);
-        m.insert(6, 745_956_260);
-        m.insert(7, 10_520_166);
-        m.insert(8, 991_319_590);
-        m.insert(9, 2_250_011_882);
-        m.insert(10, 180_106);
-        m.insert(11, 60198);
-        m.insert(12, 21_845_217);
-        m.insert(13, 11_641_012);
-        m.insert(14, 120_001);
-        m.insert(15, 60131);
-        m.insert(16, 112_463);
-        m.insert(17, 4_395_559);
-        m
-    };
-
-    // 排行榜名称
-    pub(crate) static ref TOP_NAME: HashMap<u8,&'static str>= {
-        let mut m = HashMap::new();
-        m.insert(0," 云音乐飙升榜");
-        m.insert(1," 云音乐新歌榜");
-        m.insert(2," 网易原创歌曲榜");
-        m.insert(3," 云音乐热歌榜");
-        m.insert(4," 云音乐古典音乐榜");
-        m.insert(5," 云音乐ACG音乐榜");
-        m.insert(6," 云音乐韩语榜");
-        m.insert(7," 云音乐国电榜");
-        m.insert(8," 云音乐嘻哈榜");
-        m.insert(9," 抖音排行榜");
-        m.insert(10,"UK排行榜周榜");
-        m.insert(11,"美国Billboard周榜");
-        m.insert(12,"KTV嗨榜");
-        m.insert(13,"iTunes榜");
-        m.insert(14,"Hit FM Top榜");
-        m.insert(15,"日本Oricon周榜");
-        m.insert(16,"台湾Hito排行榜");
-        m.insert(17,"华语金曲榜");
-        m
-    };
-
-    // 缓存全局配置
-    pub(crate) static ref GLOBAL_CONFIGS: Arc<RwLock<Option<Configs>>> = Arc::new(RwLock::new(None));
+#[derive(Default)]
+pub struct UserInfo {
+    pub uid: u64,
+    pub like_songs: std::collections::HashSet<u64>,
 }
 
-custom_error! { pub Errors
-    OpenSSLError{ source: openssl::error::ErrorStack } = "openSSL Error",
-    RegexError{ source: regex::Error } = "regex Error",
-    SerdeJsonError{ source: serde_json::error::Error } = "serde json Error",
-    ParseError{ source: std::num::ParseIntError } = "parse Error",
-    AsyncIoError{ source: io::Error } = "async io Error",
-    IsahcError{ source: isahc::Error } = "isahc Error",
-    NoneError = "None Error",
+#[derive(Debug)]
+pub struct PageStack {
+    gtk_stack: gtk::Stack, // add, remove, set_visible
+
+    // this is needed, as we can't remove and set_visible to gtk_stack at the same time
+    // use this to keep a clear stack for every operation
+    stack: Rc<RefCell<Vec<gtk::StackPage>>>, // push, pop, remove
+}
+
+impl PageStack {
+    pub fn new(gtk_stack: gtk::Stack) -> PageStack {
+        let pages: Vec<gtk::StackPage> = gtk_stack
+            .pages()
+            .iter::<gtk::StackPage>()
+            .unwrap()
+            .map(|p| p.unwrap())
+            .collect();
+        PageStack {
+            gtk_stack,
+            stack: Rc::new(RefCell::new(pages)),
+        }
+    }
+
+    fn set_gtk_stack_visible(&self, stack_page: &gtk::StackPage) {
+        self.gtk_stack.set_visible_child(&stack_page.child());
+    }
+
+    fn remove_from_gtk_stack(&self, stack_page: gtk::StackPage) {
+        // delay remove for animation
+        let gtk_stack = self.gtk_stack.clone();
+        let stack = self.stack.clone();
+        let ctx = glib::MainContext::default();
+        let page = stack_page.child();
+        ctx.spawn_local(async move {
+            glib::timeout_future(std::time::Duration::from_millis(500)).await;
+            if page.parent().is_some() && !stack.borrow().iter().any(|p| p.child() == page) {
+                gtk_stack.remove(&page);
+            }
+        });
+    }
+
+    pub fn new_page(&self, page: &impl glib::IsA<gtk::Widget>) -> gtk::StackPage {
+        let mut stack = self.stack.borrow_mut();
+        let page = page.clone().upcast::<gtk::Widget>();
+        let stack_page = if let Some(idx) = stack.iter().position(|p| p.child() == page) {
+            stack.remove(idx)
+        } else if page.parent().is_none() {
+            self.gtk_stack.add_child(&page)
+        } else {
+            self.gtk_stack.page(&page)
+        };
+
+        stack.push(stack_page.clone());
+        self.set_gtk_stack_visible(&stack_page);
+        stack_page
+    }
+
+    pub fn new_page_with_name(
+        &self,
+        page: &impl glib::IsA<gtk::Widget>,
+        name: &str,
+    ) -> gtk::StackPage {
+        let stack = &self.stack;
+        let old_page_idx = stack.borrow().iter().position(|p| {
+            let has_name = p.name() == Some(glib::GString::from(name));
+            if has_name {
+                p.set_name("");
+            }
+            has_name
+        });
+
+        let stack_page = self.new_page(page);
+        stack_page.set_name(name);
+
+        if let Some(old_page_idx) = old_page_idx {
+            let old_page = stack.borrow().get(old_page_idx).unwrap().clone();
+            if old_page != stack_page {
+                stack.borrow_mut().remove(old_page_idx);
+                self.remove_from_gtk_stack(old_page);
+            }
+        }
+
+        stack_page
+    }
+
+    pub fn back_page(&self) {
+        let mut stack = self.stack.borrow_mut();
+        // keep bottom page
+        if stack.len() > 1 {
+            let stack_page = stack.pop().unwrap();
+            let pre_page = stack.last().unwrap().clone();
+
+            self.set_gtk_stack_visible(&pre_page);
+            self.remove_from_gtk_stack(stack_page);
+        }
+    }
+
+    pub fn top_page(&self) -> gtk::StackPage {
+        self.stack.borrow().last().unwrap().clone()
+    }
+
+    pub fn set_transition_type(&self, transition: gtk::StackTransitionType) {
+        self.gtk_stack.set_transition_type(transition);
+    }
+
+    pub fn set_transition_duration(&self, milliseconds: u32) {
+        self.gtk_stack.set_transition_duration(milliseconds);
+    }
+
+    pub fn len(&self) -> usize {
+        self.stack.borrow().len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UserMenuChild {
+    Qr,
+    Phone,
+    User,
+}
+
+#[derive(Debug, Clone)]
+pub enum DiscoverSubPage {
+    SongList,
+    Album,
+}
+
+#[derive(Debug, Clone)]
+pub enum SongListDetail {
+    PlayList(ncm_api::PlayListDetail, ncm_api::PlayListDetailDynamic),
+    Album(ncm_api::AlbumDetail, ncm_api::AlbumDetailDynamic),
+}
+
+impl SongListDetail {
+    pub fn sis(&self) -> &Vec<SongInfo> {
+        match self {
+            Self::PlayList(d, ..) => &d.songs,
+            Self::Album(d, ..) => &d.songs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, glib::Enum)]
+#[repr(i32)]
+#[enum_type(name = "SearchType")]
+pub enum SearchType {
+    // 搜索歌曲
+    Song,
+    // 搜索歌手
+    Singer,
+    // 搜索专辑
+    Album,
+    // 搜索歌词
+    Lyrics,
+    // 搜索歌单
+    SongList,
+    // 搜索歌手歌曲
+    SingerSongs,
+    // 搜索热门歌单
+    TopPicks,
+    // 搜索全部专辑
+    AllAlbums,
+    // 搜索每日推荐歌曲
+    DailyRec,
+    // 我喜欢的音乐
+    Heartbeat,
+    // 云盘音乐
+    CloudDisk,
+    // 每人FM
+    Fm,
+    // 收藏的专辑
+    LikeAlbums,
+    // 收藏的歌单
+    LikeSongList,
+}
+
+#[derive(Debug, Clone)]
+pub enum SearchResult {
+    Songs(Vec<SongInfo>, Vec<bool>),
+    Singers(Vec<SingerInfo>),
+    SongLists(Vec<SongList>),
+}
+
+impl Default for SearchType {
+    fn default() -> Self {
+        SearchType::Song
+    }
+}
+
+impl Default for UserMenuChild {
+    fn default() -> Self {
+        UserMenuChild::Qr
+    }
+}
+
+pub trait ImageDownloadImpl {
+    // 参数
+    // url: 图片链接
+    // path: 要保存的图片本地路径
+    // size: 图片宽高象素
+    fn set_from_net(&self, url: String, path: PathBuf, size: (u16, u16), sender: &Sender<Action>);
+}
+
+impl ImageDownloadImpl for Image {
+    fn set_from_net(&self, url: String, path: PathBuf, size: (u16, u16), sender: &Sender<Action>) {
+        let image = glib::SendWeakRef::from(self.downgrade());
+        sender
+            .send(Action::DownloadImage(
+                url,
+                path.to_owned(),
+                size.0,
+                size.1,
+                Some(Arc::new(move |_| {
+                    image.upgrade().unwrap().set_from_file(Some(&path));
+                })),
+            ))
+            .unwrap();
+    }
+}
+
+impl ImageDownloadImpl for Picture {
+    fn set_from_net(&self, url: String, path: PathBuf, size: (u16, u16), sender: &Sender<Action>) {
+        let picture = glib::SendWeakRef::from(self.downgrade());
+        sender
+            .send(Action::DownloadImage(
+                url,
+                path.to_owned(),
+                size.0,
+                size.1,
+                Some(Arc::new(move |_| {
+                    let image = gtk::gdk_pixbuf::Pixbuf::from_file(&path).unwrap();
+                    let image = image
+                        .scale_simple(
+                            size.0 as i32,
+                            size.1 as i32,
+                            gtk::gdk_pixbuf::InterpType::Bilinear,
+                        )
+                        .unwrap();
+                    picture.upgrade().unwrap().set_pixbuf(Some(&image));
+                })),
+            ))
+            .unwrap();
+    }
+}
+
+impl ImageDownloadImpl for adw::Avatar {
+    fn set_from_net(&self, url: String, path: PathBuf, size: (u16, u16), sender: &Sender<Action>) {
+        let avatar = SendWeakRef::from(self.downgrade());
+        sender
+            .send(Action::DownloadImage(
+                url,
+                path.to_owned(),
+                size.0,
+                size.1,
+                Some(Arc::new(move |_| {
+                    if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file(&path) {
+                        let image = Image::from_pixbuf(Some(&pixbuf));
+                        if let Some(paintable) = image.paintable() {
+                            avatar.upgrade().unwrap().set_custom_image(Some(&paintable));
+                        }
+                    }
+                })),
+            ))
+            .unwrap();
+    }
 }
